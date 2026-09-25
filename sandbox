@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""sandbox: Docker containers for AI agents that can only see one folder.
+
+Each sandbox is a container with one folder bind-mounted at /workspace/<folder>
+and a private home volume. Tools come from a single locally built
+image, defined by the Dockerfile next to this script. `sandbox update` rebuilds
+that image with the latest version of everything and moves sandboxes onto it.
+"""
+
+import argparse
+import csv
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import termios
+import tty
+from pathlib import Path
+
+IMAGE = "sandbox-cli:latest"
+IMAGE_DIR = Path(__file__).resolve().parent  # resolve() follows the install symlink
+IMAGE_LABEL = "sandbox-cli.image"  # marks our images, so replaced ones can be pruned
+NAME_LABEL = "sandbox-cli.name"
+WORKSPACE_LABEL = "sandbox-cli.workspace"
+HOME = "/home/agent"
+# Host variables passed into every shell when set (e.g. a token from
+# `claude setup-token`, so you don't have to log in inside each sandbox).
+FORWARD_ENV = ("COLORTERM", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+NAME_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*")
+
+
+def die(message):
+    sys.exit(f"sandbox: {message}")
+
+
+def docker(*args, check=True, stream=False):
+    """Run a docker command. Output is captured unless `stream` is set."""
+    sys.stdout.flush()  # keep our messages in order with streamed docker output
+    try:
+        result = subprocess.run(["docker", *args], text=True, capture_output=not stream)
+    except FileNotFoundError:
+        die("docker not found; install Docker and make sure it's on your PATH")
+    if check and result.returncode:
+        die(result.stderr.strip() if result.stderr else f"docker {args[0]} failed")
+    return result
+
+
+def container(name):
+    return f"sandbox-{name}"
+
+
+def home_volume(name):
+    return f"sandbox-{name}-home"
+
+
+def workspace(info):
+    return info["Config"]["Labels"][WORKSPACE_LABEL]
+
+
+def mount_point(folder):
+    """Where a host folder appears inside its sandbox."""
+    return Path("/workspace", Path(folder).name)
+
+
+def sandboxes():
+    """All sandboxes, as {name: `docker inspect` output}."""
+    ids = docker("ps", "--all", "--quiet", "--filter", f"label={NAME_LABEL}").stdout.split()
+    infos = json.loads(docker("inspect", *ids).stdout) if ids else []
+    return {info["Config"]["Labels"][NAME_LABEL]: info for info in infos}
+
+
+def lookup(names):
+    """sandboxes(), after checking that every name in `names` exists."""
+    boxes = sandboxes()
+    for name in names:
+        if name not in boxes:
+            die(f"no sandbox named '{name}' (see `sandbox ls`)")
+    return boxes
+
+
+def name_for_cwd():
+    cwd = Path.cwd()
+    names = [name for name, info in sandboxes().items() if cwd.is_relative_to(workspace(info))]
+    if len(names) == 1:
+        return names[0]
+    if names:
+        die(f"several sandboxes use this folder ({', '.join(sorted(names))}); pass a name")
+    die("no sandbox for this folder; pass a name, pick one with `sandbox ls`, or create one with `sandbox create`")
+
+
+def image_id():
+    result = docker("image", "inspect", "--format", "{{.Id}}", IMAGE, check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def build_image(fresh):
+    args = [
+        "build", "--tag", IMAGE, "--label", IMAGE_LABEL,
+        # uid 0 (docker run as root) would make the agent root; fall back to 1000.
+        "--build-arg", f"USER_UID={os.getuid() or 1000}",
+        "--build-arg", f"USER_GID={os.getgid() or 1000}",
+    ]
+    if fresh:
+        args += ["--pull", "--no-cache"]  # newest base images, and re-run every install
+    docker(*args, str(IMAGE_DIR), stream=True)
+
+
+def prune_images():
+    """Remove replaced images that no sandbox uses anymore."""
+    docker("image", "prune", "--force", "--filter", f"label={IMAGE_LABEL}", check=False)
+
+
+def tool_versions(image):
+    result = docker("run", "--rm", image, "sandbox-versions", check=False)
+    return dict(line.split(" ", 1) for line in result.stdout.splitlines() if " " in line)
+
+
+def busy(name):
+    """Whether a shell or agent is running in the sandbox."""
+    top = docker("top", container(name), check=False)
+    return len(top.stdout.splitlines()) > 3  # header, then docker-init and `sleep infinity` when idle
+
+
+def run_container(name, folder):
+    mount = io.StringIO()  # --mount is CSV, so quote paths containing commas
+    csv.writer(mount).writerow(["type=bind", f"src={folder}", f"dst={mount_point(folder)}"])
+    docker(
+        "run", "--detach", "--init",
+        "--name", container(name),
+        "--hostname", re.sub(r"[^a-zA-Z0-9-]", "-", name),
+        "--label", f"{NAME_LABEL}={name}",
+        "--label", f"{WORKSPACE_LABEL}={folder}",
+        "--mount", mount.getvalue().strip(),
+        "--volume", f"{home_volume(name)}:{HOME}",
+        "--workdir", str(mount_point(folder)),
+        IMAGE,
+    )
+
+
+def copy_git_identity(name):
+    """Give the sandbox your git name/email so the agent can commit."""
+    for key in ("user.name", "user.email"):
+        try:
+            value = subprocess.run(["git", "config", key], cwd=Path.home(),
+                                   capture_output=True, text=True).stdout.strip()
+        except FileNotFoundError:
+            return
+        if value:
+            docker("exec", container(name), "git", "config", "--global", key, value)
+
+
+def cmd_create(args):
+    folder = Path(args.dir).expanduser().resolve()
+    if not folder.is_dir():
+        die(f"{folder} is not a directory")
+    if Path.home().resolve().is_relative_to(folder) and not args.force:
+        die(f"refusing to give an agent all of {folder}; pick a project folder (or pass --force)")
+    name = args.name or re.sub(r"[^a-z0-9_.-]+", "-", folder.name.lower()).strip("-_.") or "sandbox"
+    if not NAME_RE.fullmatch(name):
+        die(f"invalid name '{name}': use letters, digits, '_', '.', '-'")
+    if name in sandboxes():
+        die(f"sandbox '{name}' already exists")
+    if image_id() is None:
+        print("Building the sandbox image (first time only, takes a few minutes)...")
+        build_image(fresh=False)
+    run_container(name, str(folder))
+    copy_git_identity(name)
+    print(f"Created sandbox '{name}': {folder} is at {mount_point(folder)} inside it")
+    print(f"Enter it with: sandbox shell {name}")
+
+
+def cmd_shell(args):
+    name = args.name or name_for_cwd()
+    info = lookup([name])[name]
+    if not info["State"]["Running"]:
+        docker("start", container(name))
+    if info["Image"] != image_id():
+        print(f"sandbox: '{name}' is on an older image; `sandbox update {name}` moves it to the latest",
+              file=sys.stderr)
+    # Start in the subfolder you're in, if you're inside the sandbox's folder.
+    cwd, folder = Path.cwd(), Path(workspace(info))
+    subfolder = cwd.relative_to(folder) if cwd.is_relative_to(folder) else Path()
+    command = ["docker", "exec", "--interactive", "--workdir", str(mount_point(folder) / subfolder)]
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        # Not your TERM: the container may lack its terminfo (ghostty, kitty, ...).
+        command += ["--tty", "--env", "TERM=xterm-256color"]
+    command += [arg for var in FORWARD_ENV if var in os.environ for arg in ("--env", var)]
+    command += [container(name), *(args.command or ["bash"])]
+    os.environ.setdefault("DOCKER_CLI_HINTS", "false")  # no Docker Desktop ads when the shell exits
+    os.execvp("docker", command)
+
+
+def table(boxes):
+    """`sandbox ls` output: a header line, then one line per sandbox, sorted by name."""
+    current = image_id()
+    rows = [("NAME", "STATUS", "IMAGE", "FOLDER")] + [
+        (name, info["State"]["Status"], "current" if info["Image"] == current else "outdated", workspace(info))
+        for name, info in sorted(boxes.items())
+    ]
+    widths = [max(len(row[i]) for row in rows) for i in range(3)]
+    return ["  ".join([*(cell.ljust(width) for cell, width in zip(row, widths)), row[3]]) for row in rows]
+
+
+PICKER_HELP = "↑/↓ select · enter: open shell · u: update · d: delete · q: quit"
+PICKER_KEYS = {
+    b"\x1b[A": "up", b"\x1bOA": "up", b"k": "up",
+    b"\x1b[B": "down", b"\x1bOB": "down", b"j": "down",
+    b"\n": "shell", b"\r": "shell", b"u": "update", b"d": "delete", b"q": "quit", b"\x1b": "quit",
+}
+
+
+def pick(lines, names):
+    """Show the table with a movable selection. Returns (action, name), or None if you quit."""
+    fd, width = sys.stdin.fileno(), shutil.get_terminal_size().columns - 1
+    selected, drawn = 0, 0
+
+    def draw(footer):
+        # footer=None draws the plain table, which is left on screen afterwards.
+        nonlocal drawn
+        out = [line[:width] for line in lines]  # no wrapping, so the line count stays exact
+        if footer is not None:
+            out[selected + 1] = f"\x1b[7m{out[selected + 1]}\x1b[0m"
+            out.append(f"\x1b[2m{footer[:width]}\x1b[0m")
+        # Jump back to the top of the previous drawing and clear it.
+        sys.stdout.write((f"\x1b[{drawn}F\x1b[J" if drawn else "") + "\n".join(out) + "\n")
+        sys.stdout.flush()
+        drawn = len(out)
+
+    saved = termios.tcgetattr(fd)
+    tty.setcbreak(fd)  # read single keys without echo; ctrl-c still works
+    sys.stdout.write("\x1b[?25l")  # hide the cursor
+    try:
+        while True:
+            draw(PICKER_HELP)
+            key = PICKER_KEYS.get(os.read(fd, 8))
+            if key in ("up", "down"):
+                selected = (selected + (1 if key == "down" else -1)) % len(names)
+            elif key in ("shell", "update"):
+                return key, names[selected]
+            elif key == "delete":
+                draw(f"Delete '{names[selected]}' and its home volume? Its folder is kept. (y/N)")
+                if os.read(fd, 8) in (b"y", b"Y"):
+                    return key, names[selected]
+            elif key == "quit":
+                return None
+    finally:
+        draw(None)
+        sys.stdout.write("\x1b[?25h")
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def cmd_list(args):
+    boxes = sandboxes()
+    if not boxes:
+        print("No sandboxes. Create one with: sandbox create")
+        return
+    lines, names = table(boxes), sorted(boxes)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("\n".join(lines))  # piped or scripted: just the table
+        return
+    choice = pick(lines, names)
+    if choice is None:
+        return
+    action, name = choice
+    if action == "shell":
+        cmd_shell(argparse.Namespace(name=name, command=[]))
+    elif action == "update":
+        cmd_update(argparse.Namespace(names=[name], force=False))
+    else:
+        cmd_delete(argparse.Namespace(names=[name]))
+
+
+def cmd_update(args):
+    boxes = lookup(args.names)
+    old = image_id()
+    before = tool_versions(old) if old else {}
+    print("Rebuilding the sandbox image with the latest version of everything...")
+    build_image(fresh=True)
+    print("\nNew sandboxes now get:")
+    for tool, version in tool_versions(IMAGE).items():
+        was = before.get(tool)
+        print(f"  {tool:<7} {f'{was} -> {version}' if was and was != version else version}")
+
+    targets = args.names or sorted(boxes)
+    if targets:
+        print()
+    for name in targets:
+        folder = workspace(boxes[name])
+        if not Path(folder).is_dir():
+            print(f"Skipped '{name}': its folder {folder} no longer exists")
+        elif busy(name) and not args.force:
+            print(f"Skipped '{name}': it's in use (exit its shells and run `sandbox update {name}`, or pass --force)")
+        else:
+            docker("rm", "--force", container(name))
+            run_container(name, folder)
+            print(f"Updated '{name}'")
+    prune_images()
+
+
+def cmd_delete(args):
+    boxes = lookup(args.names)
+    for name in args.names:
+        docker("rm", "--force", container(name))
+        docker("volume", "rm", home_volume(name), check=False)
+        print(f"Deleted sandbox '{name}' (the folder {workspace(boxes[name])} is untouched)")
+    prune_images()
+
+
+def main():
+    # Everything after `--` is the command for `shell`, kept away from argparse.
+    argv = sys.argv[1:]
+    command = argv[argv.index("--") + 1:] if "--" in argv else []
+    argv = argv[:argv.index("--")] if "--" in argv else argv
+
+    parser = argparse.ArgumentParser(prog="sandbox", description="Docker sandboxes for AI agents, one folder each.")
+    sub = parser.add_subparsers(required=True, metavar="COMMAND")
+
+    p = sub.add_parser("create", help="create a sandbox that can access one folder")
+    p.add_argument("name", nargs="?", help="sandbox name (default: the folder's name)")
+    p.add_argument("-d", "--dir", default=".", help="the folder to give it (default: current folder)")
+    p.add_argument("--force", action="store_true", help="allow your home folder or one of its parents")
+    p.set_defaults(func=cmd_create)
+
+    p = sub.add_parser("shell", help="open a shell in a sandbox (sandbox shell [NAME] [-- CMD...])")
+    p.add_argument("name", nargs="?", help="sandbox name (default: the sandbox for the current folder)")
+    p.set_defaults(func=cmd_shell)
+
+    p = sub.add_parser("list", aliases=["ls"], help="list all sandboxes; pick one to open, update or delete")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("update", help="rebuild the image with the latest tools and move sandboxes onto it")
+    p.add_argument("names", nargs="*", metavar="NAME", help="sandboxes to move (default: all)")
+    p.add_argument("--force", action="store_true", help="also move sandboxes that are in use (closes their shells)")
+    p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser("delete", aliases=["rm"], help="delete sandboxes (never touches their folders)")
+    p.add_argument("names", nargs="+", metavar="NAME")
+    p.set_defaults(func=cmd_delete)
+
+    args = parser.parse_args(argv)
+    if command and args.func is not cmd_shell:
+        parser.error("`--` is only supported by `sandbox shell`")
+    args.command = command
+    args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
