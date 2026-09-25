@@ -14,11 +14,17 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
-import termios
-import tty
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    import msvcrt
+else:
+    import termios
+    import tty
 
 IMAGE = "sandbox-cli:latest"
 IMAGE_DIR = Path(__file__).resolve().parent  # resolve() follows the install symlink
@@ -28,7 +34,7 @@ WORKSPACE_LABEL = "sandbox-cli.workspace"
 HOME = "/home/agent"
 # Host variables passed into every shell when set (e.g. a token from
 # `claude setup-token`, so you don't have to log in inside each sandbox).
-FORWARD_ENV = ("COLORTERM", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+FORWARD_ENV = ("COLORTERM", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "COPILOT_GITHUB_TOKEN")
 NAME_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*")
 
 
@@ -40,7 +46,8 @@ def docker(*args, check=True, stream=False):
     """Run a docker command. Output is captured unless `stream` is set."""
     sys.stdout.flush()  # keep our messages in order with streamed docker output
     try:
-        result = subprocess.run(["docker", *args], text=True, capture_output=not stream)
+        # docker writes UTF-8 whatever the locale says (cp1252 on many Windows machines).
+        result = subprocess.run(["docker", *args], encoding="utf-8", errors="replace", capture_output=not stream)
     except FileNotFoundError:
         die("docker not found; install Docker and make sure it's on your PATH")
     if check and result.returncode:
@@ -61,8 +68,8 @@ def workspace(info):
 
 
 def mount_point(folder):
-    """Where a host folder appears inside its sandbox."""
-    return Path("/workspace", Path(folder).name)
+    """Where a host folder appears inside its sandbox (a Linux path, even on Windows)."""
+    return PurePosixPath("/workspace", Path(folder).name)
 
 
 def sandboxes():
@@ -97,11 +104,13 @@ def image_id():
 
 
 def build_image(fresh):
+    # uid 0 (docker run as root) would make the agent root, and Windows has no uids
+    # (its bind mounts ignore ownership); both fall back to 1000.
+    uid, gid = (1000, 1000) if WINDOWS else (os.getuid() or 1000, os.getgid() or 1000)
     args = [
         "build", "--tag", IMAGE, "--label", IMAGE_LABEL,
-        # uid 0 (docker run as root) would make the agent root; fall back to 1000.
-        "--build-arg", f"USER_UID={os.getuid() or 1000}",
-        "--build-arg", f"USER_GID={os.getgid() or 1000}",
+        "--build-arg", f"USER_UID={uid}",
+        "--build-arg", f"USER_GID={gid}",
     ]
     if fresh:
         args += ["--pull", "--no-cache"]  # newest base images, and re-run every install
@@ -140,12 +149,13 @@ def run_container(name, folder):
     )
 
 
-def copy_git_identity(name):
-    """Give the sandbox your git name/email so the agent can commit."""
-    for key in ("user.name", "user.email"):
+def copy_git_config(name):
+    """Give the sandbox your git name/email so the agent can commit, and your
+    core.autocrlf so files checked out with CRLF on Windows don't all look modified."""
+    for key in ("user.name", "user.email", "core.autocrlf"):
         try:
-            value = subprocess.run(["git", "config", key], cwd=Path.home(),
-                                   capture_output=True, text=True).stdout.strip()
+            value = subprocess.run(["git", "config", key], cwd=Path.home(), capture_output=True,
+                                   encoding="utf-8", errors="replace").stdout.strip()
         except FileNotFoundError:
             return
         if value:
@@ -167,7 +177,7 @@ def cmd_create(args):
         print("Building the sandbox image (first time only, takes a few minutes)...")
         build_image(fresh=False)
     run_container(name, str(folder))
-    copy_git_identity(name)
+    copy_git_config(name)
     print(f"Created sandbox '{name}': {folder} is at {mount_point(folder)} inside it")
     print(f"Enter it with: sandbox shell {name}")
 
@@ -183,13 +193,19 @@ def cmd_shell(args):
     # Start in the subfolder you're in, if you're inside the sandbox's folder.
     cwd, folder = Path.cwd(), Path(workspace(info))
     subfolder = cwd.relative_to(folder) if cwd.is_relative_to(folder) else Path()
-    command = ["docker", "exec", "--interactive", "--workdir", str(mount_point(folder) / subfolder)]
+    workdir = mount_point(folder).joinpath(*subfolder.parts)
+    command = ["docker", "exec", "--interactive", "--workdir", str(workdir)]
     if sys.stdin.isatty() and sys.stdout.isatty():
         # Not your TERM: the container may lack its terminfo (ghostty, kitty, ...).
         command += ["--tty", "--env", "TERM=xterm-256color"]
     command += [arg for var in FORWARD_ENV if var in os.environ for arg in ("--env", var)]
     command += [container(name), *(args.command or ["bash"])]
     os.environ.setdefault("DOCKER_CLI_HINTS", "false")  # no Docker Desktop ads when the shell exits
+    if WINDOWS:
+        # Windows can't replace a process: os.execvp would give your prompt back
+        # while docker still runs. Wait for docker instead, and leave ctrl-c to it.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        sys.exit(subprocess.run(command).returncode)
     os.execvp("docker", command)
 
 
@@ -212,6 +228,37 @@ PICKER_KEYS = {
 }
 
 
+def raw_keys(fd):
+    """Read single keys without echo; ctrl-c still works. Returns a function that undoes it."""
+    if WINDOWS:
+        enable_escape_codes()
+        return lambda: None  # msvcrt reads keys that way already
+    saved = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    return lambda: termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def read_key(fd):
+    """One keypress, as the bytes a Unix terminal sends for it."""
+    if not WINDOWS:
+        return os.read(fd, 8)
+    key = msvcrt.getwch()
+    if key in ("\x00", "\xe0"):  # special keys arrive as a prefix, then a code
+        return {"H": b"\x1b[A", "P": b"\x1b[B"}.get(msvcrt.getwch(), b"")
+    if key == "\x03":  # ctrl-c can arrive as a key here instead of a signal
+        raise KeyboardInterrupt
+    return key.encode()
+
+
+def enable_escape_codes():
+    """Make the Windows console act on the picker's escape codes instead of printing them."""
+    from ctypes import byref, windll, wintypes
+    handle = wintypes.HANDLE(msvcrt.get_osfhandle(sys.stdout.fileno()))
+    mode = wintypes.DWORD()
+    if windll.kernel32.GetConsoleMode(handle, byref(mode)):
+        windll.kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+
 def pick(lines, names):
     """Show the table with a movable selection. Returns (action, name), or None if you quit."""
     fd, width = sys.stdin.fileno(), shutil.get_terminal_size().columns - 1
@@ -229,27 +276,26 @@ def pick(lines, names):
         sys.stdout.flush()
         drawn = len(out)
 
-    saved = termios.tcgetattr(fd)
-    tty.setcbreak(fd)  # read single keys without echo; ctrl-c still works
+    restore = raw_keys(fd)
     sys.stdout.write("\x1b[?25l")  # hide the cursor
     try:
         while True:
             draw(PICKER_HELP)
-            key = PICKER_KEYS.get(os.read(fd, 8))
+            key = PICKER_KEYS.get(read_key(fd))
             if key in ("up", "down"):
                 selected = (selected + (1 if key == "down" else -1)) % len(names)
             elif key in ("shell", "update"):
                 return key, names[selected]
             elif key == "delete":
                 draw(f"Delete '{names[selected]}' and its home volume? Its folder is kept. (y/N)")
-                if os.read(fd, 8) in (b"y", b"Y"):
+                if read_key(fd) in (b"y", b"Y"):
                     return key, names[selected]
             elif key == "quit":
                 return None
     finally:
         draw(None)
         sys.stdout.write("\x1b[?25h")
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        restore()
 
 
 def cmd_list(args):
@@ -280,9 +326,11 @@ def cmd_update(args):
     print("Rebuilding the sandbox image with the latest version of everything...")
     build_image(fresh=True)
     print("\nNew sandboxes now get:")
-    for tool, version in tool_versions(IMAGE).items():
+    after = tool_versions(IMAGE)
+    width = max(map(len, after), default=0)
+    for tool, version in after.items():
         was = before.get(tool)
-        print(f"  {tool:<7} {f'{was} -> {version}' if was and was != version else version}")
+        print(f"  {tool:<{width}} {f'{was} -> {version}' if was and was != version else version}")
 
     targets = args.names or sorted(boxes)
     if targets:

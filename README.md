@@ -1,8 +1,17 @@
 # sandbox
 
 A small wrapper around Docker that gives an AI agent a container which can only
-see **one folder**. It comes with Python 3.14, Claude Code, Node.js LTS, uv, git
-and the GitHub CLI, and one command updates all of them.
+see **one folder**. It runs on macOS, Linux and Windows, and one command updates
+everything in it:
+
+- **Agents:** Claude Code and GitHub Copilot CLI
+- **Python 3.14:** uv, ruff (lint and format), pyright (type checking)
+- **Node.js LTS:** npm, pnpm and yarn (through corepack), TypeScript (`tsc`),
+  `tsx`, ESLint, Prettier
+- **Language servers** for agents' code intelligence plugins:
+  `typescript-language-server` (projects on TypeScript 6 or older),
+  `tsc --lsp --stdio` (TypeScript 7) and `pyright-langserver`
+- **Tools:** git, the GitHub CLI, ripgrep, jq, tmux, build-essential and more
 
 ```
 sandbox create [NAME] [--dir DIR]   create a sandbox for DIR (default: current folder)
@@ -33,12 +42,29 @@ prints only the table.
 
 Requires Docker and Python 3.9+ (standard library only).
 
+On macOS and Linux:
+
 ```sh
 ln -s "$PWD/sandbox" ~/.local/bin/sandbox   # any directory on your PATH
 ```
 
-Keep the symlink. The script finds the `Dockerfile` through it. The first
-`sandbox create` builds the image, which takes a couple of minutes.
+Keep the symlink. The script finds the `Dockerfile` through it.
+
+On Windows, install [Docker Desktop](https://docs.docker.com/desktop/setup/install/windows-install/)
+(with the WSL 2 backend) and Python, then add this folder to your PATH. From
+PowerShell, in the folder:
+
+```powershell
+$path = [Environment]::GetEnvironmentVariable("Path", "User")
+[Environment]::SetEnvironmentVariable("Path", "$path;$PWD", "User")
+```
+
+Open a new terminal and `sandbox` works from PowerShell or cmd. It runs through
+`sandbox.cmd`, which starts the script with the `py` launcher (or `python`).
+Use Windows Terminal for the `sandbox ls` picker. If you work inside WSL
+instead, follow the macOS/Linux steps there.
+
+The first `sandbox create` builds the image, which takes a few minutes.
 
 ## Typical use
 
@@ -47,6 +73,7 @@ cd ~/code/my-app
 sandbox create
 sandbox shell                                          # a bash shell in /workspace/my-app
 sandbox shell -- claude --dangerously-skip-permissions  # or run the agent directly
+sandbox shell -- copilot --allow-all                    # or Copilot
 ```
 
 ## Updating
@@ -60,9 +87,10 @@ prints what changed:
 
 ```
 New sandboxes now get:
-  claude  2.1.270 -> 2.1.282
-  python  3.14.7
-  node    24.21.0
+  claude      2.1.270 -> 2.1.282
+  copilot     1.0.88
+  python      3.14.7
+  node        24.21.0
   ...
 ```
 
@@ -74,14 +102,15 @@ Recreating a sandbox keeps:
 
 - **the folder**, which is bind-mounted from your machine;
 - **the home directory** (`/home/agent`), a per-sandbox Docker volume that holds
-  the Claude login and settings, shell history, git config, `uv tool` and
-  `npm -g` installs.
+  the Claude and Copilot logins and settings, shell history, git config,
+  `uv tool` and `npm -g` installs.
 
 Anything else is reset, such as packages the agent installed with
 `sudo apt-get`. To keep a tool, add it to the `Dockerfile`.
 
-Claude Code's auto-updater is off inside sandboxes (`DISABLE_AUTOUPDATER=1`),
-so it won't nag or update itself. `sandbox update` handles it. The image's
+The auto-updaters of Claude Code and Copilot CLI are off inside sandboxes
+(`DISABLE_AUTOUPDATER=1`, `COPILOT_AUTO_UPDATE=false`), so they won't nag or
+update themselves. `sandbox update` handles them. The image's
 tools also come first on `PATH`, so a stray copy in the home volume (for
 example from `claude install`) can't shadow a newer one.
 
@@ -93,13 +122,22 @@ keeps its own home volume, so it never sees what the image puts there. To
 include a new tool in the version report, add a line to `sandbox-versions` in
 the `Dockerfile`.
 
-## Logging in to Claude
+## Logging in
 
 Each sandbox has its own home, so you log in once per sandbox and the login
-survives updates. To skip that step, run `claude setup-token` on your machine
-and `export CLAUDE_CODE_OAUTH_TOKEN=...` in your shell profile. `sandbox shell`
-forwards `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` into the sandbox
-when they're set. Your git `user.name` and `user.email` are copied in at
+survives updates. To skip that step, set a token in your shell profile (or,
+on Windows, as a user environment variable) and `sandbox shell` forwards it
+into the sandbox:
+
+- **Claude Code:** run `claude setup-token` on your machine and set
+  `CLAUDE_CODE_OAUTH_TOKEN`, or set `ANTHROPIC_API_KEY`.
+- **Copilot CLI:** create a fine-grained personal access token with the
+  "Copilot Requests" permission and set `COPILOT_GITHUB_TOKEN`. Otherwise run
+  `copilot` and use `/login`.
+
+`GH_TOKEN` and `GITHUB_TOKEN` are *not* forwarded, since they would give the
+agent your GitHub access; run `gh auth login` inside a sandbox if you want
+that. Your git `user.name`, `user.email` and `core.autocrlf` are copied in at
 creation, so the agent can commit.
 
 ## What the agent can and can't reach
@@ -110,7 +148,8 @@ creation, so the agent can commit.
   There's no access to the rest of your filesystem, other sandboxes, or the
   Docker socket.
 - It runs as a non-root user whose uid matches yours, so files it creates
-  belong to you. It has passwordless `sudo` inside the container.
+  belong to you (on Windows, where files have no uid, it's 1000). It has
+  passwordless `sudo` inside the container.
 - **Network access is unrestricted.** It needs that for the Claude API, pip
   and npm.
 - `sandbox create` refuses to mount your home directory, or a folder that
@@ -119,7 +158,13 @@ creation, so the agent can commit.
 ## Notes
 
 - `.venv` and `node_modules` in the folder contain platform-specific binaries.
-  If you also use them from macOS, the sandbox (Linux) and your machine will
-  keep rebuilding each other's copies.
+  If you also use them from macOS or Windows, the sandbox (Linux) and your
+  machine will keep rebuilding each other's copies.
+- The global `eslint` and `prettier` are for quick use. In a project, the
+  agent should run the project's own versions (`npm run lint`, `npx eslint`).
+- On Windows, a folder on a Windows drive is shared into the Linux VM, which
+  makes file access in the sandbox noticeably slower than on macOS or Linux.
+  For big projects, keep them in the WSL filesystem and run `sandbox` from
+  WSL.
 - Each update leaves about 1.5 GB of Docker build cache. Docker reclaims it on
   its own over time, or immediately with `docker builder prune`.

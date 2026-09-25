@@ -1,0 +1,4 @@
+# LF everywhere, even in a Windows checkout: the script's shebang and the
+# Dockerfile's heredoc scripts break with CRLF. Batch files need CRLF.
+* text=auto eol=lf
+*.cmd text eol=crlf

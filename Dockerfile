@@ -15,6 +15,7 @@ ARG PYTHON_VERSION=3.14
 
 FROM node:lts-trixie-slim AS node
 FROM ghcr.io/astral-sh/uv:latest AS uv
+FROM ghcr.io/astral-sh/ruff:latest AS ruff
 
 FROM python:${PYTHON_VERSION}-slim-trixie
 
@@ -39,8 +40,27 @@ COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
-# uv and uvx.
+# Global npm tools. These go under /usr/local: the ENV below that points
+# `npm install -g` at the home volume only applies after this point.
+#   @github/copilot   GitHub Copilot CLI (`copilot`)
+#   typescript, tsx   `tsc`, and `tsx` to run .ts files directly
+#   eslint, prettier  JS/TS linter and formatter
+#   typescript-language-server, pyright
+#                     language servers for code intelligence plugins. The first
+#                     wraps the tsserver of a project's own TypeScript 6 or older;
+#                     TypeScript 7 has none, and serves LSP itself (`tsc --lsp`).
+#                     `pyright` also type-checks from the command line.
+#   corepack          provides `pnpm` and `yarn`, at the version a project's
+#                     package.json asks for
+RUN npm install --global \
+        @github/copilot corepack eslint prettier pyright tsx typescript \
+        typescript-language-server \
+ && corepack enable \
+ && rm -rf /root/.npm
+
+# uv and uvx, and ruff (Python linter and formatter).
 COPY --from=uv /uv /uvx /usr/local/bin/
+COPY --from=ruff /ruff /usr/local/bin/
 
 # Claude Code. The official installer puts it under $HOME; move the binary out
 # so the image owns it (and `sandbox update` can replace it).
@@ -69,14 +89,25 @@ RUN set -eux; \
 COPY --chmod=0755 <<'EOF' /usr/local/bin/sandbox-versions
 #!/bin/sh
 echo "claude $(claude --version | cut -d' ' -f1)"
+echo "copilot $(copilot --version | head -n1 | grep -oE '[0-9]+(\.[0-9]+)+')"
 echo "python $(python3 --version | cut -d' ' -f2)"
 echo "node $(node --version | tr -d v)"
+echo "npm $(npm --version)"
+echo "typescript $(tsc --version | cut -d' ' -f2)"
+echo "tsx $(tsx --version | head -n1 | cut -d' ' -f2 | tr -d v)"
+echo "eslint $(eslint --version | tr -d v)"
+echo "prettier $(prettier --version)"
+echo "pyright $(pyright --version | cut -d' ' -f2)"
 echo "uv $(uv --version | cut -d' ' -f2)"
+echo "ruff $(ruff --version | cut -d' ' -f2)"
 echo "git $(git --version | cut -d' ' -f3)"
 echo "gh $(gh --version | head -n1 | cut -d' ' -f3)"
 EOF
 
-# DISABLE_AUTOUPDATER: Claude Code is updated by `sandbox update`, not by itself.
+# DISABLE_AUTOUPDATER, COPILOT_AUTO_UPDATE: Claude Code and Copilot CLI are
+#   updated by `sandbox update`, not by themselves.
+# COREPACK_ENABLE_DOWNLOAD_PROMPT: fetch a project's pnpm/yarn without asking
+#   (the prompt would block an agent).
 # UV_LINK_MODE: uv's cache (home volume) and your .venv (mounted folder) live on
 #   different filesystems, so hardlinking always fails; copy without warning.
 # NPM_CONFIG_PREFIX: `npm install -g` goes to the home volume, no sudo needed.
@@ -84,6 +115,8 @@ EOF
 #   (e.g. by `claude install`) can never shadow the image's newer one.
 ENV LANG=C.UTF-8 \
     DISABLE_AUTOUPDATER=1 \
+    COPILOT_AUTO_UPDATE=false \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     UV_LINK_MODE=copy \
     NPM_CONFIG_PREFIX=/home/agent/.npm-global \
     PATH=$PATH:/home/agent/.local/bin:/home/agent/.npm-global/bin
