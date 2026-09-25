@@ -19,6 +19,7 @@ sandbox shell  [NAME] [-- CMD...]   open a shell in it (or run CMD)
 sandbox ls                          list every sandbox; pick one to open, update or delete
 sandbox update [NAME...]            fetch the latest tools, move sandboxes onto them
 sandbox delete NAME...              delete sandboxes (their folders are never touched)
+sandbox registry [npm|pypi] [URL]   use a company package registry (see below)
 ```
 
 Every command works from any directory. `NAME` defaults to the folder's name
@@ -144,6 +145,30 @@ into the sandbox:
 agent your GitHub access; run `gh auth login` inside a sandbox if you want
 that. Your git `user.name`, `user.email` and `core.autocrlf` are copied in at
 creation, so the agent can commit.
+
+## Company package registries
+
+If your network blocks the public npm registry or PyPI, so you have to use
+your company's mirror, give `sandbox` its address:
+
+```sh
+sandbox registry npm https://artifactory.example.com/api/npm/npm/
+sandbox registry pypi https://artifactory.example.com/api/pypi/pypi/simple
+```
+
+Every new shell in every sandbox then uses them: npm, pnpm, yarn and corepack
+use the npm registry, and pip and uv use the PyPI one. The image build uses the
+npm registry too, to install Copilot CLI, TypeScript and the other npm tools,
+so set it before your first `sandbox create`.
+
+`sandbox registry` shows the current settings, and `sandbox registry npm
+--unset` goes back to the public registry. They're saved in
+`~/.config/sandbox-cli/config.json` (`%APPDATA%\sandbox-cli\config.json` on
+Windows).
+
+If the registry needs a login, run `npm login --registry URL` inside a
+sandbox. The login is kept in the sandbox's home. The image build doesn't log
+in, so it needs a registry that allows downloads without one.
 
 ## What the agent can and can't reach
 

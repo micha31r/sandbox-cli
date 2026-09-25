@@ -52,6 +52,9 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 #                     `pyright` also type-checks from the command line.
 #   corepack          provides `pnpm` and `yarn`, at the version a project's
 #                     package.json asks for
+# NPM_CONFIG_REGISTRY: set by `sandbox registry npm URL`, where the public
+#   registry is blocked. Unset otherwise, so npm uses the public one.
+ARG NPM_CONFIG_REGISTRY
 RUN npm install --global \
         @github/copilot corepack eslint prettier pyright tsx typescript \
         typescript-language-server \

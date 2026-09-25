@@ -35,6 +35,14 @@ HOME = "/home/agent"
 # Host variables passed into every shell when set (e.g. a token from
 # `claude setup-token`, so you don't have to log in inside each sandbox).
 FORWARD_ENV = ("COLORTERM", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "COPILOT_GITHUB_TOKEN")
+# Package registries set with `sandbox registry` (a company mirror, when the
+# public ones are blocked), and the variables that point each tool at them.
+REGISTRY_ENV = {
+    "npm": ("NPM_CONFIG_REGISTRY", "COREPACK_NPM_REGISTRY", "YARN_NPM_REGISTRY_SERVER"),
+    "pypi": ("PIP_INDEX_URL", "UV_DEFAULT_INDEX"),
+}
+CONFIG_FILE = Path(os.environ["APPDATA"] if WINDOWS else os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config",
+                   "sandbox-cli", "config.json")
 NAME_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*")
 
 
@@ -53,6 +61,18 @@ def docker(*args, check=True, stream=False):
     if check and result.returncode:
         die(result.stderr.strip() if result.stderr else f"docker {args[0]} failed")
     return result
+
+
+def load_config():
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+
+
+def registries():
+    """{"npm": url, "pypi": url}, for the ones that are set."""
+    return load_config().get("registries", {})
 
 
 def container(name):
@@ -114,6 +134,9 @@ def build_image(fresh):
     ]
     if fresh:
         args += ["--pull", "--no-cache"]  # newest base images, and re-run every install
+    npm_registry = registries().get("npm")
+    if npm_registry:
+        args += ["--build-arg", f"NPM_CONFIG_REGISTRY={npm_registry}"]
     docker(*args, str(IMAGE_DIR), stream=True)
 
 
@@ -199,6 +222,8 @@ def cmd_shell(args):
         # Not your TERM: the container may lack its terminfo (ghostty, kitty, ...).
         command += ["--tty", "--env", "TERM=xterm-256color"]
     command += [arg for var in FORWARD_ENV if var in os.environ for arg in ("--env", var)]
+    command += [arg for kind, url in registries().items() for var in REGISTRY_ENV[kind]
+                for arg in ("--env", f"{var}={url}")]
     command += [container(name), *(args.command or ["bash"])]
     os.environ.setdefault("DOCKER_CLI_HINTS", "false")  # no Docker Desktop ads when the shell exits
     if WINDOWS:
@@ -357,6 +382,32 @@ def cmd_delete(args):
     prune_images()
 
 
+def cmd_registry(args):
+    config = load_config()
+    saved = config.setdefault("registries", {})
+    if args.url and args.unset:
+        die("pass a URL or --unset, not both")
+    if not (args.url or args.unset):
+        for kind in [args.kind] if args.kind else REGISTRY_ENV:
+            print(f"{kind:<5} {saved.get(kind, 'public (default)')}")
+        return
+    if not args.kind:
+        die("say which registry to reset: `sandbox registry npm --unset` or `sandbox registry pypi --unset`")
+    if args.unset:
+        saved.pop(args.kind, None)
+        done = f"Sandboxes use the public {args.kind} registry again"
+    elif re.match(r"https?://", args.url):
+        saved[args.kind] = args.url
+        done = f"Sandboxes now use {args.url} for {args.kind}, in every new shell"
+        if args.kind == "npm":
+            done += " and when the image is built (the first `sandbox create`, and `sandbox update`)"
+    else:
+        die(f"'{args.url}' isn't a URL; it should start with https:// (or http://)")
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    print(done)
+
+
 def main():
     # Everything after `--` is the command for `shell`, kept away from argparse.
     argv = sys.argv[1:]
@@ -387,6 +438,13 @@ def main():
     p = sub.add_parser("delete", aliases=["rm"], help="delete sandboxes (never touches their folders)")
     p.add_argument("names", nargs="+", metavar="NAME")
     p.set_defaults(func=cmd_delete)
+
+    p = sub.add_parser("registry", help="use a company package registry in sandboxes (sandbox registry [npm|pypi] [URL])")
+    p.add_argument("kind", nargs="?", choices=list(REGISTRY_ENV), metavar="npm|pypi",
+                   help="npm: npm, pnpm and yarn; pypi: pip and uv (default: show both)")
+    p.add_argument("url", nargs="?", metavar="URL", help="the registry to use (default: show the current one)")
+    p.add_argument("--unset", action="store_true", help="go back to the public registry")
+    p.set_defaults(func=cmd_registry)
 
     args = parser.parse_args(argv)
     if command and args.func is not cmd_shell:
