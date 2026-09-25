@@ -23,7 +23,7 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         build-essential ca-certificates curl file git jq less nano \
-        openssh-client procps ripgrep sudo tree unzip vim wget zip; \
+        openssh-client procps ripgrep sudo tmux tree unzip vim wget zip; \
     install -d -m 0755 /etc/apt/keyrings; \
     curl -fsSL -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
         https://cli.github.com/packages/githubcli-archive-keyring.gpg; \
