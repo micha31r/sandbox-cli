@@ -40,31 +40,36 @@ prints only the table.
 
 ## Install
 
-Requires Docker and Python 3.9+ (standard library only).
+Requires Docker and Python 3.9+ (standard library only). Clone this repository
+to a folder where it can stay, and run the installer from there.
 
-On macOS and Linux:
+On macOS, Linux and WSL:
 
 ```sh
-ln -s "$PWD/sandbox" ~/.local/bin/sandbox   # any directory on your PATH
+./install.sh             # or ./install.sh ~/bin to link into another directory
 ```
 
-Keep the symlink. The script finds the `Dockerfile` through it.
+It links `sandbox` into `~/.local/bin` and, if that directory isn't on your
+PATH yet, adds it in your shell's startup file (`.zshrc`, `.bashrc`, ...).
+Keep the repository where it is: the script finds the `Dockerfile` through the
+link.
 
 On Windows, install [Docker Desktop](https://docs.docker.com/desktop/setup/install/windows-install/)
-(with the WSL 2 backend) and Python, then add this folder to your PATH. From
-PowerShell, in the folder:
+(with the WSL 2 backend) and Python, then run this in PowerShell, in the
+repository's folder:
 
 ```powershell
-$path = [Environment]::GetEnvironmentVariable("Path", "User")
-[Environment]::SetEnvironmentVariable("Path", "$path;$PWD", "User")
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-Open a new terminal and `sandbox` works from PowerShell or cmd. It runs through
-`sandbox.cmd`, which starts the script with the `py` launcher (or `python`).
-Use Windows Terminal for the `sandbox ls` picker. If you work inside WSL
-instead, follow the macOS/Linux steps there.
+It adds the folder to your user PATH. Open a new terminal and `sandbox` works
+from PowerShell or cmd. It runs through `sandbox.cmd`, which starts the script
+with the `py` launcher (or `python`). Use Windows Terminal for the `sandbox ls`
+picker. If you work inside WSL instead, run `install.sh` there.
 
-The first `sandbox create` builds the image, which takes a few minutes.
+Both installers are safe to run again, and tell you if Docker or Python is
+missing. The first `sandbox create` builds the image, which takes a few
+minutes.
 
 ## Typical use
 
